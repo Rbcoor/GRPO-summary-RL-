@@ -28,7 +28,7 @@ class SummaryJudge:
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
-            dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
         )
 
@@ -441,15 +441,15 @@ def round_score(used_rounds: int, max_rounds: int) -> float:
 
 
 def length_score(char_count: int) -> float:
-    """Soft reward for summaries that are neither too short nor too long."""
-    if char_count < 200:
-        return 0.2
+    """Soft reward for summaries near the 350-word target."""
     if char_count < 400:
-        return char_count / 400.0
-    if char_count <= 1200:
+        return 0.2
+    if char_count < 900:
+        return 0.2 + (0.8 * ((char_count - 400) / 500.0))
+    if char_count <= 2400:
         return 1.0
-    if char_count <= 2000:
-        return 1.0 - ((char_count - 1200) / 800.0)
+    if char_count <= 3200:
+        return 1.0 - ((char_count - 2400) / 800.0)
     return 0.0
 
 

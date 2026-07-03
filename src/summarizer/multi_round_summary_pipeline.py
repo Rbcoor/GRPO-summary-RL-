@@ -33,7 +33,7 @@ class LocalModelRunner:
             model_path,
             local_files_only=True,
             trust_remote_code=True,
-            dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
         )
 
@@ -163,7 +163,7 @@ class MultiRoundSummaryPipeline:
                     latest_decision_json=center.latest_decision_json(),
                 )
 
-            summary = runner.chat(summary_messages, max_new_tokens=512)
+            summary = runner.chat(summary_messages, max_new_tokens=768)
             trajectory.add_model_call(
                 step_name="initial_summary" if summary_round == 1 else "revision_summary",
                 round_id=summary_round,

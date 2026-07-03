@@ -32,7 +32,7 @@ class LocalQwen:
             model_path,
             local_files_only=True,
             trust_remote_code=True,
-            dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
         )
 
@@ -158,7 +158,7 @@ def main() -> None:
     # Step 3: generate summary from message-center single-message interfaces.
     center.set_round(2)
     summary_messages = build_summary_messages(center)
-    summary = qwen.chat(summary_messages, max_new_tokens=512)
+    summary = qwen.chat(summary_messages, max_new_tokens=768)
     center.add_summary(
         round_id=center.current_round,
         summary=summary,

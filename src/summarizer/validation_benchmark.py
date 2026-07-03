@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import multiprocessing as mp
+import queue
 import json
 import os
 import random
@@ -24,6 +27,48 @@ from summary_judge import SummaryJudge, compute_training_reward, update_trajecto
 from trajectory_store import TrajectoryStore
 
 
+def vllm_judge_worker(
+    benchmark: "ValidationBenchmark",
+    input_queue: Any,
+    output_queue: Any,
+) -> None:
+    """Run judge-side vLLM in a process with its own CUDA visibility."""
+    if benchmark.judge_cuda_visible_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = benchmark.judge_cuda_visible_devices
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HOME", "/tmp/repliqa_hf_home")
+
+    try:
+        judge_model = VLLMChatModel(
+            benchmark.judge_model_path,
+            gpu_memory_utilization=benchmark.judge_gpu_memory_utilization,
+            max_model_len=benchmark.judge_max_model_len,
+        )
+        output_queue.put(
+            {
+                "event": "judge_worker_ready",
+                "judge_runner": "vllm",
+                "judge_cuda_visible_devices": benchmark.judge_cuda_visible_devices,
+                "judge_model_path": str(benchmark.judge_model_path),
+                "judge_gpu_memory_utilization": benchmark.judge_gpu_memory_utilization,
+                "judge_max_model_len": benchmark.judge_max_model_len,
+            }
+        )
+        while True:
+            states = input_queue.get()
+            if states is None:
+                break
+            output_queue.put({"event": "judge_batch_result", "items": benchmark._judge_states(states, judge_model)})
+    except BaseException as exc:
+        output_queue.put(
+            {
+                "event": "judge_worker_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        raise
+
+
 class DeviceChatModel:
     """Minimal local chat model pinned to one CUDA device."""
 
@@ -39,7 +84,7 @@ class DeviceChatModel:
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
-            dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map={"": device} if torch.cuda.is_available() else None,
         )
         if not torch.cuda.is_available():
@@ -214,6 +259,12 @@ class ValidationBenchmark:
         summary_runner: str = "vllm",
         summary_gpu_memory_utilization: float = 0.80,
         summary_max_model_len: int | None = None,
+        judge_runner: str = "vllm",
+        judge_gpu_memory_utilization: float = 0.70,
+        judge_max_model_len: int | None = 4096,
+        judge_max_new_tokens: int = 1024,
+        judge_cuda_visible_devices: str | None = None,
+        judge_batch_size: int | None = None,
         fuzzy_threshold: float = 0.88,
         limit: int | None = None,
         start_index: int = 0,
@@ -232,6 +283,12 @@ class ValidationBenchmark:
         self.summary_runner = summary_runner
         self.summary_gpu_memory_utilization = summary_gpu_memory_utilization
         self.summary_max_model_len = summary_max_model_len
+        self.judge_runner = judge_runner
+        self.judge_gpu_memory_utilization = judge_gpu_memory_utilization
+        self.judge_max_model_len = judge_max_model_len
+        self.judge_max_new_tokens = judge_max_new_tokens
+        self.judge_cuda_visible_devices = judge_cuda_visible_devices
+        self.judge_batch_size = max(1, judge_batch_size or summary_batch_size)
         self.fuzzy_threshold = fuzzy_threshold
         self.limit = limit
         self.start_index = start_index
@@ -256,10 +313,14 @@ class ValidationBenchmark:
             summary_model = DeviceChatModel(self.summary_model_path, self.summary_device)
         else:
             raise ValueError(f"unsupported summary_runner: {self.summary_runner}")
-        judge_model = DeviceChatModel(self.judge_model_path, self.judge_device)
+        judge_model = None
+        if self.judge_runner == "transformers":
+            judge_model = DeviceChatModel(self.judge_model_path, self.judge_device)
+        elif self.judge_runner != "vllm":
+            raise ValueError(f"unsupported judge_runner: {self.judge_runner}")
 
         started_at = time.time()
-        if self.summary_batch_size > 1:
+        if self.summary_batch_size > 1 or self.judge_runner == "vllm":
             items = self.run_batched_documents(
                 files=files,
                 summary_model=summary_model,
@@ -307,7 +368,7 @@ class ValidationBenchmark:
                 item = {
                     "validation_index": offset,
                     "document_path": str(document_path),
-                    "error": repr(exc),
+                    "error": self._stage_error("document", exc),
                     "total_seconds": round(time.time() - item_started_at, 3),
                 }
             self._append_progress_item(progress_path, items, item)
@@ -318,49 +379,323 @@ class ValidationBenchmark:
         *,
         files: list[Path],
         summary_model: Any,
-        judge_model: DeviceChatModel,
+        judge_model: Any,
+    ) -> list[dict[str, Any]]:
+        if self.judge_runner == "vllm":
+            return self._run_batched_documents_with_vllm_judge(
+                files=files,
+                summary_model=summary_model,
+            )
+
+        items: list[dict[str, Any]] = []
+        progress_path = self.output_dir / "validation_items.jsonl"
+        pending_judge_batches: list[concurrent.futures.Future[list[dict[str, Any]]]] = []
+
+        def collect_finished_judge_batches(*, wait_for_all: bool = False) -> None:
+            nonlocal pending_judge_batches
+            if wait_for_all:
+                concurrent.futures.wait(pending_judge_batches)
+            remaining: list[concurrent.futures.Future[list[dict[str, Any]]]] = []
+            for future in pending_judge_batches:
+                if not future.done():
+                    remaining.append(future)
+                    continue
+                for item in future.result():
+                    self._append_progress_item(progress_path, items, item)
+            pending_judge_batches = remaining
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as judge_executor:
+            for start in range(0, len(files), self.summary_batch_size):
+                batch_files = files[start : start + self.summary_batch_size]
+                states: list[DocumentRunState] = []
+                for local_offset, document_path in enumerate(batch_files, start=start):
+                    validation_index = self.start_index + local_offset
+                    try:
+                        states.append(self._init_document_state(document_path, validation_index))
+                    except Exception as exc:
+                        item = {
+                            "validation_index": validation_index,
+                            "document_path": str(document_path),
+                            "error": self._stage_error("document_init", exc),
+                            "total_seconds": 0.0,
+                        }
+                        self._append_progress_item(progress_path, items, item)
+
+                self._run_summary_batch(states, summary_model)
+                pending_judge_batches.append(
+                    judge_executor.submit(self._judge_states, states, judge_model)
+                )
+                collect_finished_judge_batches()
+
+            collect_finished_judge_batches(wait_for_all=True)
+        return items
+
+    def _run_batched_documents_with_vllm_judge(
+        self,
+        *,
+        files: list[Path],
+        summary_model: Any,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         progress_path = self.output_dir / "validation_items.jsonl"
-        for start in range(0, len(files), self.summary_batch_size):
-            batch_files = files[start : start + self.summary_batch_size]
-            states: list[DocumentRunState] = []
-            for local_offset, document_path in enumerate(batch_files, start=start):
-                validation_index = self.start_index + local_offset
-                try:
-                    states.append(self._init_document_state(document_path, validation_index))
-                except Exception as exc:
-                    item = {
-                        "validation_index": validation_index,
-                        "document_path": str(document_path),
-                        "error": repr(exc),
-                        "total_seconds": 0.0,
-                    }
+        ctx = mp.get_context("spawn")
+        input_queue: Any = ctx.Queue(maxsize=2)
+        output_queue: Any = ctx.Queue()
+        judge_buffer: list[DocumentRunState] = []
+        worker = ctx.Process(
+            target=vllm_judge_worker,
+            args=(self, input_queue, output_queue),
+            daemon=False,
+        )
+        worker.start()
+        pending_batches = 0
+        worker_ready = False
+
+        def handle_message(message: dict[str, Any]) -> None:
+            nonlocal pending_batches, worker_ready
+            event = message.get("event")
+            if event == "judge_worker_ready":
+                worker_ready = True
+                print(json.dumps(message, ensure_ascii=False), flush=True)
+                return
+            if event == "judge_batch_result":
+                pending_batches -= 1
+                for item in message["items"]:
                     self._append_progress_item(progress_path, items, item)
+                return
+            if event == "judge_worker_error":
+                raise RuntimeError(message.get("error", "judge worker failed"))
+            raise RuntimeError(f"unknown judge worker message: {message}")
 
-            self._run_summary_batch(states, summary_model)
+        def drain_available_messages() -> None:
+            while True:
+                try:
+                    message = output_queue.get_nowait()
+                except queue.Empty:
+                    break
+                handle_message(message)
 
-            for state in states:
-                if state.error is not None:
-                    item = {
+        def submit_judge_batch(batch_states: list[DocumentRunState]) -> None:
+            nonlocal pending_batches
+            input_queue.put(batch_states)
+            pending_batches += 1
+
+        try:
+            for start in range(0, len(files), self.summary_batch_size):
+                drain_available_messages()
+                batch_files = files[start : start + self.summary_batch_size]
+                states: list[DocumentRunState] = []
+                for local_offset, document_path in enumerate(batch_files, start=start):
+                    validation_index = self.start_index + local_offset
+                    try:
+                        states.append(self._init_document_state(document_path, validation_index))
+                    except Exception as exc:
+                        item = {
+                            "validation_index": validation_index,
+                            "document_path": str(document_path),
+                            "error": self._stage_error("document_init", exc),
+                            "total_seconds": 0.0,
+                        }
+                        self._append_progress_item(progress_path, items, item)
+
+                self._run_summary_batch(states, summary_model)
+                judge_buffer.extend(states)
+                while len(judge_buffer) >= self.judge_batch_size:
+                    submit_judge_batch(judge_buffer[: self.judge_batch_size])
+                    del judge_buffer[: self.judge_batch_size]
+                drain_available_messages()
+
+            if judge_buffer:
+                submit_judge_batch(list(judge_buffer))
+                judge_buffer.clear()
+            input_queue.put(None)
+            while pending_batches > 0 or worker.is_alive():
+                try:
+                    message = output_queue.get(timeout=1.0)
+                except queue.Empty:
+                    if not worker.is_alive() and pending_batches > 0:
+                        raise RuntimeError("judge worker exited before returning all batches")
+                    continue
+                handle_message(message)
+                if pending_batches == 0 and not worker.is_alive():
+                    break
+            worker.join(timeout=5.0)
+            if worker.exitcode not in (0, None):
+                raise RuntimeError(f"judge worker exited with code {worker.exitcode}")
+            if not worker_ready:
+                raise RuntimeError("judge worker did not report ready")
+        finally:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=5.0)
+        return items
+
+    def _judge_states(
+        self,
+        states: list[DocumentRunState],
+        judge_model: Any,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        prepared: list[dict[str, Any]] = []
+
+        for state in states:
+            if state.error is not None:
+                items.append(
+                    {
                         "validation_index": state.validation_index,
                         "document_path": str(state.document_path),
                         "document_id": state.center.document_id,
                         "error": state.error,
                         "total_seconds": round(time.time() - state.started_at, 3),
                     }
-                else:
-                    try:
-                        item = self._judge_and_save_state(state, judge_model)
-                    except Exception as exc:
-                        item = {
-                            "validation_index": state.validation_index,
-                            "document_path": str(state.document_path),
-                            "document_id": state.center.document_id,
-                            "error": repr(exc),
-                            "total_seconds": round(time.time() - state.started_at, 3),
-                        }
-                self._append_progress_item(progress_path, items, item)
+                )
+                continue
+            try:
+                saved = self._save_workflow_outputs(state)
+                answer_messages = SummaryJudge.answer_messages(
+                    document_id=state.center.document_id,
+                    summary=state.final_summary or "",
+                    questions=state.center.questions,
+                )
+                prepared.append({"state": state, "saved": saved, "answer_messages": answer_messages})
+            except Exception as exc:
+                items.append(
+                    {
+                        "validation_index": state.validation_index,
+                        "document_path": str(state.document_path),
+                        "document_id": state.center.document_id,
+                        "error": self._stage_error("judge_prepare", exc),
+                        "total_seconds": round(time.time() - state.started_at, 3),
+                    }
+                )
+
+        if not prepared:
+            return items
+
+        answer_raw_outputs = judge_model.chat_batch(
+            [item["answer_messages"] for item in prepared],
+            max_new_tokens=self.judge_max_new_tokens,
+            enable_thinking=False,
+        )
+
+        score_requests: list[dict[str, Any]] = []
+        for item, answer_raw_output in zip(prepared, answer_raw_outputs):
+            state = item["state"]
+            try:
+                parsed_answers = SummaryJudge._parse_json(answer_raw_output)
+                generated_answers = SummaryJudge._normalize_generated_answers(parsed_answers)
+            except Exception as exc:
+                self._save_judge_parse_error(
+                    doc_output_dir=state.doc_output_dir,
+                    document_id=state.center.document_id,
+                    stage="answer_questions",
+                    raw_output=answer_raw_output,
+                    error=exc,
+                )
+                items.append(
+                    {
+                        "validation_index": state.validation_index,
+                        "document_path": str(state.document_path),
+                        "document_id": state.center.document_id,
+                        "error": self._stage_error("answer_questions", exc),
+                        "total_seconds": round(time.time() - state.started_at, 3),
+                    }
+                )
+                continue
+
+            score_messages = SummaryJudge.score_messages(
+                document_id=state.center.document_id,
+                generated_answers=generated_answers,
+                questions=state.center.questions,
+            )
+            score_requests.append(
+                {
+                    **item,
+                    "answer_raw_output": answer_raw_output,
+                    "generated_answers": generated_answers,
+                    "score_messages": score_messages,
+                }
+            )
+
+        if not score_requests:
+            return items
+
+        score_raw_outputs = judge_model.chat_batch(
+            [item["score_messages"] for item in score_requests],
+            max_new_tokens=self.judge_max_new_tokens,
+            enable_thinking=False,
+        )
+
+        for item, score_raw_output in zip(score_requests, score_raw_outputs):
+            state = item["state"]
+            saved = item["saved"]
+            try:
+                parsed_judge = SummaryJudge._parse_json(score_raw_output)
+                judge_result = SummaryJudge._normalize_result(parsed_judge)
+                reward = compute_training_reward(
+                    judge_result=judge_result,
+                    total_questions=len(state.center.questions),
+                    submitted=state.submitted,
+                    used_rounds=state.center.current_round,
+                    max_rounds=self.max_summary_rounds,
+                    summary_chars=len(state.final_summary or ""),
+                )
+                judge_result["answer_raw_output"] = item["answer_raw_output"]
+                judge_result["score_raw_output"] = score_raw_output
+                judge_result["generated_answers"] = item["generated_answers"]
+                judge_result["judge_model"] = str(self.judge_model_path)
+                judge_result["judge_model_final_score"] = judge_result["final_score"]
+                judge_result["final_score"] = reward["final_score"]
+                judge_result["reward_components"] = reward["components"]
+                judge_result["reward_weights"] = reward["weights"]
+                judge_result["document_id"] = state.center.document_id
+                judge_result["result_json"] = str(saved["result_path"])
+                judge_result["trajectory_path"] = str(saved["trajectory_path"])
+                judge_result["trajectory_reward_updated"] = True
+                saved["judge_path"].write_text(
+                    json.dumps(judge_result, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                update_trajectory_reward(saved["trajectory_path"], judge_result)
+                components = judge_result["reward_components"]
+                items.append(
+                    {
+                        "validation_index": state.validation_index,
+                        "document_id": state.center.document_id,
+                        "answered_questions": components["answered_questions"],
+                        "total_questions": components["total_questions"],
+                        "answer_score": components["answer_score"],
+                        "final_score": judge_result["final_score"],
+                        "submitted": state.submitted,
+                        "submit_round": state.submit_round,
+                        "early_submit": saved["result"]["early_submit"],
+                        "summary_rounds_used": state.center.current_round,
+                        "summary_chars": len(state.final_summary or ""),
+                        "total_seconds": round(time.time() - state.started_at, 3),
+                        "result_path": str(saved["result_path"]),
+                        "state_path": str(saved["state_path"]),
+                        "trajectory_path": str(saved["trajectory_path"]),
+                        "judge_result_path": str(saved["judge_path"]),
+                    }
+                )
+            except Exception as exc:
+                self._save_judge_parse_error(
+                    doc_output_dir=state.doc_output_dir,
+                    document_id=state.center.document_id,
+                    stage="score_answers",
+                    raw_output=score_raw_output,
+                    error=exc,
+                    generated_answers=item["generated_answers"],
+                )
+                items.append(
+                    {
+                        "validation_index": state.validation_index,
+                        "document_path": str(state.document_path),
+                        "document_id": state.center.document_id,
+                        "error": self._stage_error("score_answers", exc),
+                        "total_seconds": round(time.time() - state.started_at, 3),
+                    }
+                )
         return items
 
     @staticmethod
@@ -420,6 +755,54 @@ class ValidationBenchmark:
             trajectory=trajectory,
         )
 
+    @staticmethod
+    def _stage_error(stage: str, exc: Exception) -> str:
+        return f"{stage}: {type(exc).__name__}: {exc}"
+
+    def _chat_batch_with_fallback(
+        self,
+        *,
+        summary_model: Any,
+        requests: list[dict[str, Any]],
+        max_new_tokens: int,
+        stage: str,
+    ) -> list[str | None]:
+        """Run chat_batch, then fall back to per-document calls if the batch fails."""
+        if not requests:
+            return []
+        messages_batch = [request["messages"] for request in requests]
+        try:
+            return summary_model.chat_batch(messages_batch, max_new_tokens=max_new_tokens)
+        except Exception as batch_exc:
+            print(
+                json.dumps(
+                    {
+                        "event": "batch_generation_failed",
+                        "stage": stage,
+                        "error": repr(batch_exc),
+                        "fallback": "per_document",
+                        "count": len(requests),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        outputs: list[str | None] = []
+        for request in requests:
+            state = request["state"]
+            try:
+                outputs.append(
+                    summary_model.chat(
+                        request["messages"],
+                        max_new_tokens=max_new_tokens,
+                    )
+                )
+            except Exception as exc:
+                state.error = self._stage_error(stage, exc)
+                outputs.append(None)
+        return outputs
+
     def _run_summary_batch(
         self,
         states: list[DocumentRunState],
@@ -429,27 +812,31 @@ class ValidationBenchmark:
         if not active:
             return
 
-        keyword_messages = [
-            self.prompt_manager.keyword_extraction_messages(
-                state.center.document_text_message()["document_text"]
-            )
+        keyword_requests = [
+            {
+                "state": state,
+                "messages": self.prompt_manager.keyword_extraction_messages(
+                    state.center.document_text_message()["document_text"]
+                ),
+            }
             for state in active
         ]
-        try:
-            raw_keyword_outputs = summary_model.chat_batch(
-                keyword_messages,
-                max_new_tokens=256,
-            )
-        except Exception as exc:
-            for state in active:
-                state.error = repr(exc)
-            return
+        raw_keyword_outputs = self._chat_batch_with_fallback(
+            summary_model=summary_model,
+            requests=keyword_requests,
+            max_new_tokens=256,
+            stage="initial_keyword_extraction",
+        )
 
-        for state, messages, raw_keywords in zip(active, keyword_messages, raw_keyword_outputs):
+        for request, raw_keywords in zip(keyword_requests, raw_keyword_outputs):
+            state = request["state"]
+            messages = request["messages"]
+            if state.error is not None or raw_keywords is None:
+                continue
             try:
                 keywords = self._parse_keyword_list(raw_keywords)
             except Exception as exc:
-                state.error = repr(exc)
+                state.error = self._stage_error("initial_keyword_extraction_parse", exc)
                 continue
             state.pending_keywords = keywords
             state.trajectory.add_model_call(
@@ -476,24 +863,28 @@ class ValidationBenchmark:
 
             summary_requests: list[dict[str, Any]] = []
             for state in active:
-                state.center.set_round(summary_round)
-                recall = state.retriever.recall(state.pending_keywords)
-                state.trajectory.add_system_step(
-                    step_name="paragraph_recall",
-                    round_id=summary_round,
-                    payload={
-                        "keywords": state.pending_keywords,
-                        "top_k": recall["query"]["top_k"],
-                        "retrieved_count": recall["retrieved_count"],
-                        "paragraph_ids": [p["paragraph_id"] for p in recall["paragraphs"]],
-                    },
-                )
-                state.center.add_recall_set(
-                    round_id=summary_round,
-                    keywords=state.pending_keywords,
-                    paragraphs=recall["paragraphs"],
-                    source="paragraph_retriever",
-                )
+                try:
+                    state.center.set_round(summary_round)
+                    recall = state.retriever.recall(state.pending_keywords)
+                    state.trajectory.add_system_step(
+                        step_name="paragraph_recall",
+                        round_id=summary_round,
+                        payload={
+                            "keywords": state.pending_keywords,
+                            "top_k": recall["query"]["top_k"],
+                            "retrieved_count": recall["retrieved_count"],
+                            "paragraph_ids": [p["paragraph_id"] for p in recall["paragraphs"]],
+                        },
+                    )
+                    state.center.add_recall_set(
+                        round_id=summary_round,
+                        keywords=state.pending_keywords,
+                        paragraphs=recall["paragraphs"],
+                        source="paragraph_retriever",
+                    )
+                except Exception as exc:
+                    state.error = self._stage_error("paragraph_recall", exc)
+                    continue
                 if summary_round == 1:
                     messages = self.prompt_manager.initial_summary_messages(
                         round_json=state.center.round_json(),
@@ -520,20 +911,17 @@ class ValidationBenchmark:
                     }
                 )
 
-            try:
-                summaries = summary_model.chat_batch(
-                    [request["messages"] for request in summary_requests],
-                    max_new_tokens=512,
-                )
-            except Exception as exc:
-                for request in summary_requests:
-                    request["state"].error = repr(exc)
-                continue
+            summaries = self._chat_batch_with_fallback(
+                summary_model=summary_model,
+                requests=summary_requests,
+                max_new_tokens=768,
+                stage="summary_generation",
+            )
 
             decision_requests: list[dict[str, Any]] = []
             for request, summary in zip(summary_requests, summaries):
                 state = request["state"]
-                if state.error is not None:
+                if state.error is not None or summary is None:
                     continue
                 state.trajectory.add_model_call(
                     step_name=request["step_name"],
@@ -565,24 +953,21 @@ class ValidationBenchmark:
                     }
                 )
 
-            try:
-                raw_decisions = summary_model.chat_batch(
-                    [request["messages"] for request in decision_requests],
-                    max_new_tokens=192,
-                )
-            except Exception as exc:
-                for request in decision_requests:
-                    request["state"].error = repr(exc)
-                continue
+            raw_decisions = self._chat_batch_with_fallback(
+                summary_model=summary_model,
+                requests=decision_requests,
+                max_new_tokens=192,
+                stage="submit_decision",
+            )
 
             for request, raw_decision in zip(decision_requests, raw_decisions):
                 state = request["state"]
-                if state.error is not None:
+                if state.error is not None or raw_decision is None:
                     continue
                 try:
                     decision = self._parse_decision(raw_decision)
                 except Exception as exc:
-                    state.error = repr(exc)
+                    state.error = self._stage_error("submit_decision_parse", exc)
                     continue
                 state.trajectory.add_model_call(
                     step_name="submit_decision",
@@ -626,7 +1011,67 @@ class ValidationBenchmark:
 
         for state in states:
             if state.error is None and state.final_summary is None:
-                state.error = f"ValueError('no summary generated for {state.document_path}')"
+                state.error = f"summary_generation: ValueError: no summary generated for {state.document_path}"
+
+    def _save_workflow_outputs(self, state: DocumentRunState) -> dict[str, Any]:
+        if state.final_summary is None:
+            raise ValueError(f"no summary generated for {state.document_path}")
+
+        center = state.center
+        final_summary = state.final_summary
+        state_path = state.doc_output_dir / f"{center.document_id}.multi_round_state.json"
+        result_path = state.doc_output_dir / f"{center.document_id}.multi_round_result.json"
+        trajectory_path = state.doc_output_dir / f"{center.document_id}.trajectory.json"
+        judge_path = state.doc_output_dir / f"{center.document_id}.judge_result.json"
+
+        state.trajectory.set_metrics(
+            {
+                "submitted": state.submitted,
+                "summary_rounds_used": center.current_round,
+                "summary_count": len(center.summaries),
+                "decision_count": len(center.decisions),
+                "recall_set_count": len(center.recall_sets),
+                "final_summary_chars": len(final_summary),
+                "summary_batch_size": self.summary_batch_size,
+            }
+        )
+        center.save(state_path)
+        state.trajectory.save(trajectory_path)
+
+        result = {
+            "sampled_document": {
+                "document_path": str(state.document_path),
+                "document_id": center.document_id,
+                "document_topic": center.document_topic,
+                "source_pdf": center.source_pdf,
+                "paragraph_count": state.paragraph_count,
+            },
+            "validation_index": state.validation_index,
+            "submitted": state.submitted,
+            "submit_round": state.submit_round,
+            "early_submit": bool(
+                state.submitted
+                and state.submit_round is not None
+                and state.submit_round < self.max_summary_rounds
+            ),
+            "summary_rounds_used": center.current_round,
+            "max_summary_rounds": self.max_summary_rounds,
+            "final_summary": final_summary,
+            "message_center_state": str(state_path),
+            "trajectory_path": str(trajectory_path),
+            "trace": {"rounds": state.rounds},
+        }
+        result_path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "state_path": state_path,
+            "result_path": result_path,
+            "trajectory_path": trajectory_path,
+            "judge_path": judge_path,
+            "result": result,
+        }
 
     def _judge_and_save_state(
         self,
@@ -869,7 +1314,7 @@ class ValidationBenchmark:
                 )
                 step_name = "revision_summary"
 
-            summary = summary_model.chat(summary_messages, max_new_tokens=512)
+            summary = summary_model.chat(summary_messages, max_new_tokens=768)
             trajectory.add_model_call(
                 step_name=step_name,
                 round_id=summary_round,
@@ -1082,6 +1527,12 @@ class ValidationBenchmark:
             "summary_runner": self.summary_runner,
             "summary_gpu_memory_utilization": self.summary_gpu_memory_utilization,
             "summary_max_model_len": self.summary_max_model_len,
+            "judge_runner": self.judge_runner,
+            "judge_gpu_memory_utilization": self.judge_gpu_memory_utilization,
+            "judge_max_model_len": self.judge_max_model_len,
+            "judge_max_new_tokens": self.judge_max_new_tokens,
+            "judge_cuda_visible_devices": self.judge_cuda_visible_devices,
+            "judge_batch_size": self.judge_batch_size,
             "summary_device": self.summary_device,
             "judge_device": self.judge_device,
         }
@@ -1214,8 +1665,8 @@ class ValidationBenchmark:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run fixed validation benchmark.")
     parser.add_argument("--dataset-root", type=Path, default=Path("/tmp/repliqa_documents_by_file"))
-    parser.add_argument("--summary-model-path", type=Path, default=Path("/root/yaojiaxin/RL/models/Qwen2.5-3B-Instruct"))
-    parser.add_argument("--judge-model-path", type=Path, default=Path("/root/yaojiaxin/RL/models/Qwen3-14B"))
+    parser.add_argument("--summary-model-path", type=Path, default=Path("/tmp/models/Qwen2.5-3B-Instruct"))
+    parser.add_argument("--judge-model-path", type=Path, default=Path("/tmp/models/Qwen3-14B"))
     parser.add_argument("--output-dir", type=Path, default=Path("/tmp/summary_validation_benchmark"))
     parser.add_argument("--split", default="repliqa_0")
     parser.add_argument("--split-seed", type=int, default=80)
@@ -1225,6 +1676,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-runner", choices=["vllm", "transformers"], default="vllm")
     parser.add_argument("--summary-gpu-memory-utilization", type=float, default=0.80)
     parser.add_argument("--summary-max-model-len", type=int)
+    parser.add_argument("--judge-runner", choices=["vllm", "transformers"], default="vllm")
+    parser.add_argument("--judge-gpu-memory-utilization", type=float, default=0.70)
+    parser.add_argument("--judge-max-model-len", type=int, default=4096)
+    parser.add_argument("--judge-max-new-tokens", type=int, default=1024)
+    parser.add_argument("--judge-cuda-visible-devices")
+    parser.add_argument(
+        "--judge-batch-size",
+        type=int,
+        help="Number of completed summaries to batch together for judge-side calls. Defaults to summary batch size.",
+    )
     parser.add_argument("--summary-device", default="cuda:0")
     parser.add_argument("--judge-device", default="cuda:1")
     parser.add_argument("--fuzzy-threshold", type=float, default=0.88)
@@ -1244,6 +1705,14 @@ def main() -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HOME", "/tmp/repliqa_hf_home")
+    judge_cuda_visible_devices = args.judge_cuda_visible_devices
+    if judge_cuda_visible_devices is None:
+        visible_devices = [device.strip() for device in args.gpus.split(",") if device.strip()]
+        if len(visible_devices) >= 2:
+            judge_cuda_visible_devices = visible_devices[1]
+        elif visible_devices:
+            judge_cuda_visible_devices = visible_devices[0]
+
     benchmark = ValidationBenchmark(
         dataset_root=args.dataset_root,
         summary_model_path=args.summary_model_path,
@@ -1258,6 +1727,12 @@ def main() -> None:
         summary_runner=args.summary_runner,
         summary_gpu_memory_utilization=args.summary_gpu_memory_utilization,
         summary_max_model_len=args.summary_max_model_len,
+        judge_runner=args.judge_runner,
+        judge_gpu_memory_utilization=args.judge_gpu_memory_utilization,
+        judge_max_model_len=args.judge_max_model_len,
+        judge_max_new_tokens=args.judge_max_new_tokens,
+        judge_cuda_visible_devices=judge_cuda_visible_devices,
+        judge_batch_size=args.judge_batch_size,
         fuzzy_threshold=args.fuzzy_threshold,
         limit=args.limit,
         start_index=args.start_index,

@@ -859,9 +859,13 @@ validation_files = files[:91]
 - `summary_runner`：摘要推理后端，默认 `vllm`
 - `summary_gpu_memory_utilization`：vLLM 摘要模型显存利用率，默认 `0.80`
 - `summary_max_model_len`：可选，vLLM 摘要模型最大上下文长度
-- `summary_batch_size`：摘要侧按文档批处理的 batch size，默认 `4`；设为 `1` 时回到逐文档顺序生成
+- `summary_batch_size`：摘要侧按文档批处理的 batch size，启动脚本默认 `3`；设为 `1` 时摘要侧回到逐文档生成
+- `judge_runner`：judge 侧运行方式，默认 `vllm`，也可设为 `transformers`
+- `judge_batch_size`：judge 侧两阶段评测 batch size，启动脚本默认 `6`
+- `judge_max_model_len`：judge vLLM 最大上下文长度，启动脚本默认 `4096`
+- `judge_max_new_tokens`：judge 每阶段最大输出 tokens，启动脚本默认 `1024`
 - `summary_device`：摘要模型使用的可见 CUDA 设备，默认 `cuda:0`
-- `judge_device`：judge 模型使用的可见 CUDA 设备，默认 `cuda:1`
+- `judge_device`：transformers judge 使用的可见 CUDA 设备，默认 `cuda:1`；vLLM judge 通过独立进程固定到 `GPUS` 中第二张物理 GPU
 - `limit`：可选，只跑前 N 篇，用于 smoke test
 - `start_index`：可选，从验证集中的指定下标开始跑，用于断点续跑
 
@@ -900,10 +904,15 @@ validation_files = files[:91]
 ### 命令行示例
 
 ```bash
-/root/.conda/envs/summaryRL/bin/python src/summarizer/validation_benchmark.py \
+/root/miniforge3/envs/gen-summary/bin/python src/summarizer/validation_benchmark.py \
   --gpus 1,4 \
   --summary-runner vllm \
-  --summary-batch-size 4 \
+  --summary-model-path /tmp/models/Qwen2.5-3B-Instruct \
+  --judge-runner vllm \
+  --judge-model-path /tmp/models/Qwen3-14B \
+  --summary-batch-size 3 \
+  --judge-batch-size 6 \
+  --judge-max-model-len 4096 \
   --max-summary-rounds 5 \
   --output-dir /tmp/summary_validation_benchmark
 ```
@@ -911,18 +920,23 @@ validation_files = files[:91]
 只跑前 3 篇做快速测试：
 
 ```bash
-/root/.conda/envs/summaryRL/bin/python src/summarizer/validation_benchmark.py \
+/root/miniforge3/envs/gen-summary/bin/python src/summarizer/validation_benchmark.py \
   --gpus 1,4 \
   --summary-runner vllm \
-  --summary-batch-size 4 \
+  --summary-model-path /tmp/models/Qwen2.5-3B-Instruct \
+  --judge-runner vllm \
+  --judge-model-path /tmp/models/Qwen3-14B \
+  --summary-batch-size 3 \
+  --judge-batch-size 6 \
+  --judge-max-model-len 4096 \
   --max-summary-rounds 5 \
   --limit 3 \
   --output-dir /tmp/summary_validation_benchmark_smoke
 ```
 
-### 摘要侧批处理
+### 摘要与 judge 并行批处理
 
-`validation_benchmark.py` 默认将多篇文档按阶段进行摘要侧 batch 推理：
+`validation_benchmark.py` 默认将多篇文档按阶段进行摘要侧 batch 推理，并将完成摘要的文档异步送入 judge 侧评测。摘要生成不需要等待上一批 judge 全部完成；如果 judge 侧队列满了，`input_queue(maxsize=2)` 会对摘要侧形成反压，避免 3500 条长跑时无限积压内存。
 
 1. 对 batch 内所有文档同时进行关键词提取。
 2. 本地逐文档执行段落召回，并写入各自的 `MessageCenter` 与 `TrajectoryStore`。
@@ -932,13 +946,25 @@ validation_files = files[:91]
 
 批处理只改变推理调度方式，不合并不同文档的消息中心或轨迹。每个文档仍独立保存 `document_id`、`round_id`、召回段落、摘要、提交判断和最终 reward。
 
-关键词提取阶段的生成上限为 `256` tokens，用于降低模型返回 JSON 数组时被截断导致解析失败的概率。
+judge 侧使用 Qwen3-14B 时默认走 vLLM 独立进程，固定到 `GPUS` 中第二张物理卡。评测分两阶段批处理：先用 final summary + questions 批量生成 answers，再用 generated answers + reference answers 批量打分。`judge_buffer` 只暂存未凑满的少量 state；默认 `judge_batch_size=6` 时最多暂存 5 条，队列最多再挂起 2 个 judge batch。
+
+关键词提取阶段的生成上限为 `256` tokens，用于降低模型返回 JSON 数组时被截断导致解析失败的概率。摘要生成阶段的上限为 `768` tokens。
 
 如果关键词模型异常重复输出导致 JSON 数组被截断，验证脚本会从已生成文本中提取完整引号字符串，按大小写无关方式去重，并最多保留 7 个关键词继续流程。
+
+### 错误跳过策略
+
+验证流程不会因为单篇文档的摘要生成、关键词解析、段落召回、提交判断或 judge 保存错误而直接退出。顺序模式会捕获单篇文档异常并在 `validation_items.jsonl` 中写入 `error` 字段；批处理模式如果某一次 `chat_batch` 调用失败，会先记录 `batch_generation_failed` 事件并自动降级为逐文档生成。逐文档重试仍失败时，只标记该文档错误并继续处理同批次和后续批次的其他文档。当前对 JSON 解析失败本身不做自动重试，例如 `submit_decision_parse`、judge `answer_questions` 或 `score_answers` 解析失败会直接标记为 error，并保留原始输出用于后处理。
+
+错误项会保留 `validation_index`、`document_path`、可用时的 `document_id`、`error` 和 `total_seconds`。最终 `validation_report.json` 中的 `aggregate.error_count` 会统计失败文档数量，成功文档继续参与平均分和提交率统计。
 
 ### 启动脚本
 
 `run_validation_vllm.sh`
+
+### 环境
+
+默认使用 `/root/miniforge3/envs/gen-summary/bin/python` 运行摘要生成与验证流程。该环境只安装推理和评测依赖，例如 `torch`、`transformers`、`vllm`、`datasets`、`accelerate`、`openai`，不承担 ART 本地训练后端。若需要临时切换解释器，可以通过 `PYTHON=/path/to/python ./run_validation_vllm.sh` 覆盖。
 
 从仓库根目录启动固定 91 篇验证集评测，摘要侧使用 vLLM，judge 侧使用本地 Qwen3-14B：
 
@@ -949,17 +975,27 @@ validation_files = files[:91]
 常用环境变量：
 
 - `OUTPUT_DIR`：输出目录，默认 `/tmp/summary_validation_benchmark_91_vllm_r5`
+- `SUMMARY_MODEL_PATH`：摘要模型路径，默认 `/tmp/models/Qwen2.5-3B-Instruct`
+- `JUDGE_MODEL_PATH`：judge 模型路径，默认 `/tmp/models/Qwen3-14B`
 - `GPUS`：可见 GPU，默认 `1,4`
 - `MAX_SUMMARY_ROUNDS`：最大摘要轮次，默认 `5`
-- `SUMMARY_BATCH_SIZE`：摘要侧按文档批处理的 batch size，默认 `4`
+- `SUMMARY_BATCH_SIZE`：摘要侧按文档批处理的 batch size，默认 `3`
+- `JUDGE_BATCH_SIZE`：judge 侧两阶段评测 batch size，默认 `6`
+- `JUDGE_RUNNER`：judge 运行方式，默认 `vllm`
+- `JUDGE_MAX_MODEL_LEN`：judge vLLM 最大上下文长度，默认 `4096`
+- `JUDGE_MAX_NEW_TOKENS`：judge 每阶段最大输出 tokens，默认 `1024`
 - `LIMIT`：只跑前 N 篇，用于 smoke test
 - `START_INDEX`：从验证集指定下标开始跑
 - `SUMMARY_GPU_MEMORY_UTILIZATION`：vLLM 摘要模型显存利用率，默认 `0.80`
+- `JUDGE_GPU_MEMORY_UTILIZATION`：vLLM judge 模型显存利用率，默认 `0.70`
 
 例如只跑 1 篇：
 
 ```bash
 LIMIT=1 OUTPUT_DIR=/tmp/summary_validation_vllm_smoke ./run_validation_vllm.sh
+
+# 使用当前稳定测试组合跑 3500 条时，可显式写出：
+SUMMARY_BATCH_SIZE=3 JUDGE_BATCH_SIZE=6 LIMIT=3500 ./run_validation_vllm.sh
 ```
 
 ## `art_trajectory_adapter.py`
