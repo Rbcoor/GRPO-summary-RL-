@@ -95,6 +95,8 @@ class DeviceChatModel:
         messages: list[dict[str, str]],
         *,
         max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
         enable_thinking: bool | None = None,
     ) -> str:
         kwargs: dict[str, Any] = {
@@ -111,12 +113,13 @@ class DeviceChatModel:
 
         inputs = self.tokenizer([prompt], return_tensors="pt").to(self.model.device)
         with torch.no_grad():
+            do_sample = temperature > 0
             generated = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=None,
-                top_p=None,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
+                top_p=top_p if do_sample else None,
             )
         new_tokens = generated[:, inputs.input_ids.shape[1] :]
         return self.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
@@ -126,12 +129,16 @@ class DeviceChatModel:
         messages_batch: list[list[dict[str, str]]],
         *,
         max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
         enable_thinking: bool | None = None,
     ) -> list[str]:
         return [
             self.chat(
                 messages,
                 max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
                 enable_thinking=enable_thinking,
             )
             for messages in messages_batch
@@ -168,6 +175,8 @@ class VLLMChatModel:
         messages: list[dict[str, str]],
         *,
         max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
         enable_thinking: bool | None = None,
     ) -> str:
         kwargs: dict[str, Any] = {
@@ -183,7 +192,8 @@ class VLLMChatModel:
             prompt = self.tokenizer.apply_chat_template(messages, **kwargs)
 
         sampling_params = self.SamplingParams(
-            temperature=0.0,
+            temperature=temperature,
+            top_p=top_p,
             max_tokens=max_new_tokens,
         )
         outputs = self.llm.generate([prompt], sampling_params, use_tqdm=False)
@@ -194,6 +204,8 @@ class VLLMChatModel:
         messages_batch: list[list[dict[str, str]]],
         *,
         max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
         enable_thinking: bool | None = None,
     ) -> list[str]:
         prompts: list[str] = []
@@ -212,7 +224,8 @@ class VLLMChatModel:
             prompts.append(prompt)
 
         sampling_params = self.SamplingParams(
-            temperature=0.0,
+            temperature=temperature,
+            top_p=top_p,
             max_tokens=max_new_tokens,
         )
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
@@ -224,6 +237,8 @@ class DocumentRunState:
     """Per-document state used by batched summary generation."""
 
     validation_index: int
+    sample_index: int
+    run_index: int
     document_path: Path
     started_at: float
     center: MessageCenter
@@ -269,6 +284,9 @@ class ValidationBenchmark:
         limit: int | None = None,
         start_index: int = 0,
         summary_batch_size: int = 4,
+        samples_per_document: int = 1,
+        summary_temperature: float = 0.0,
+        summary_top_p: float = 1.0,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.summary_model_path = Path(summary_model_path)
@@ -293,6 +311,9 @@ class ValidationBenchmark:
         self.limit = limit
         self.start_index = start_index
         self.summary_batch_size = max(1, summary_batch_size)
+        self.samples_per_document = max(1, samples_per_document)
+        self.summary_temperature = summary_temperature
+        self.summary_top_p = summary_top_p
         self.prompt_manager = PromptManager()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -302,6 +323,7 @@ class ValidationBenchmark:
             files = files[self.start_index :]
         if self.limit is not None:
             files = files[: self.limit]
+        run_specs = self._expand_run_specs(files)
 
         if self.summary_runner == "vllm":
             summary_model = VLLMChatModel(
@@ -322,19 +344,19 @@ class ValidationBenchmark:
         started_at = time.time()
         if self.summary_batch_size > 1 or self.judge_runner == "vllm":
             items = self.run_batched_documents(
-                files=files,
+                run_specs=run_specs,
                 summary_model=summary_model,
                 judge_model=judge_model,
             )
         else:
             items = self.run_sequential_documents(
-                files=files,
+                run_specs=run_specs,
                 summary_model=summary_model,
                 judge_model=judge_model,
             )
 
         report = {
-            "config": self.config(len(files)),
+            "config": self.config(len(files), len(run_specs)),
             "aggregate": self.aggregate(items, time.time() - started_at),
             "items": items,
         }
@@ -349,25 +371,29 @@ class ValidationBenchmark:
     def run_sequential_documents(
         self,
         *,
-        files: list[Path],
+        run_specs: list[dict[str, Any]],
         summary_model: Any,
         judge_model: DeviceChatModel,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         progress_path = self.output_dir / "validation_items.jsonl"
-        for offset, document_path in enumerate(files, start=self.start_index):
+        for spec in run_specs:
             item_started_at = time.time()
             try:
                 item = self.run_document(
-                    document_path=document_path,
+                    document_path=spec["document_path"],
                     summary_model=summary_model,
                     judge_model=judge_model,
-                    validation_index=offset,
+                    validation_index=spec["validation_index"],
+                    sample_index=spec["sample_index"],
+                    run_index=spec["run_index"],
                 )
             except Exception as exc:  # Keep long validation runs inspectable.
                 item = {
-                    "validation_index": offset,
-                    "document_path": str(document_path),
+                    "validation_index": spec["validation_index"],
+                    "sample_index": spec["sample_index"],
+                    "run_index": spec["run_index"],
+                    "document_path": str(spec["document_path"]),
                     "error": self._stage_error("document", exc),
                     "total_seconds": round(time.time() - item_started_at, 3),
                 }
@@ -377,13 +403,13 @@ class ValidationBenchmark:
     def run_batched_documents(
         self,
         *,
-        files: list[Path],
+        run_specs: list[dict[str, Any]],
         summary_model: Any,
         judge_model: Any,
     ) -> list[dict[str, Any]]:
         if self.judge_runner == "vllm":
             return self._run_batched_documents_with_vllm_judge(
-                files=files,
+                run_specs=run_specs,
                 summary_model=summary_model,
             )
 
@@ -405,17 +431,18 @@ class ValidationBenchmark:
             pending_judge_batches = remaining
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as judge_executor:
-            for start in range(0, len(files), self.summary_batch_size):
-                batch_files = files[start : start + self.summary_batch_size]
+            for start in range(0, len(run_specs), self.summary_batch_size):
+                batch_specs = run_specs[start : start + self.summary_batch_size]
                 states: list[DocumentRunState] = []
-                for local_offset, document_path in enumerate(batch_files, start=start):
-                    validation_index = self.start_index + local_offset
+                for spec in batch_specs:
                     try:
-                        states.append(self._init_document_state(document_path, validation_index))
+                        states.append(self._init_document_state(spec))
                     except Exception as exc:
                         item = {
-                            "validation_index": validation_index,
-                            "document_path": str(document_path),
+                            "validation_index": spec["validation_index"],
+                            "sample_index": spec["sample_index"],
+                            "run_index": spec["run_index"],
+                            "document_path": str(spec["document_path"]),
                             "error": self._stage_error("document_init", exc),
                             "total_seconds": 0.0,
                         }
@@ -433,7 +460,7 @@ class ValidationBenchmark:
     def _run_batched_documents_with_vllm_judge(
         self,
         *,
-        files: list[Path],
+        run_specs: list[dict[str, Any]],
         summary_model: Any,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -481,18 +508,19 @@ class ValidationBenchmark:
             pending_batches += 1
 
         try:
-            for start in range(0, len(files), self.summary_batch_size):
+            for start in range(0, len(run_specs), self.summary_batch_size):
                 drain_available_messages()
-                batch_files = files[start : start + self.summary_batch_size]
+                batch_specs = run_specs[start : start + self.summary_batch_size]
                 states: list[DocumentRunState] = []
-                for local_offset, document_path in enumerate(batch_files, start=start):
-                    validation_index = self.start_index + local_offset
+                for spec in batch_specs:
                     try:
-                        states.append(self._init_document_state(document_path, validation_index))
+                        states.append(self._init_document_state(spec))
                     except Exception as exc:
                         item = {
-                            "validation_index": validation_index,
-                            "document_path": str(document_path),
+                            "validation_index": spec["validation_index"],
+                            "sample_index": spec["sample_index"],
+                            "run_index": spec["run_index"],
+                            "document_path": str(spec["document_path"]),
                             "error": self._stage_error("document_init", exc),
                             "total_seconds": 0.0,
                         }
@@ -543,6 +571,8 @@ class ValidationBenchmark:
                 items.append(
                     {
                         "validation_index": state.validation_index,
+                        "sample_index": state.sample_index,
+                        "run_index": state.run_index,
                         "document_path": str(state.document_path),
                         "document_id": state.center.document_id,
                         "error": state.error,
@@ -562,6 +592,8 @@ class ValidationBenchmark:
                 items.append(
                     {
                         "validation_index": state.validation_index,
+                        "sample_index": state.sample_index,
+                        "run_index": state.run_index,
                         "document_path": str(state.document_path),
                         "document_id": state.center.document_id,
                         "error": self._stage_error("judge_prepare", exc),
@@ -595,6 +627,8 @@ class ValidationBenchmark:
                 items.append(
                     {
                         "validation_index": state.validation_index,
+                        "sample_index": state.sample_index,
+                        "run_index": state.run_index,
                         "document_path": str(state.document_path),
                         "document_id": state.center.document_id,
                         "error": self._stage_error("answer_questions", exc),
@@ -661,6 +695,8 @@ class ValidationBenchmark:
                 items.append(
                     {
                         "validation_index": state.validation_index,
+                        "sample_index": state.sample_index,
+                        "run_index": state.run_index,
                         "document_id": state.center.document_id,
                         "answered_questions": components["answered_questions"],
                         "total_questions": components["total_questions"],
@@ -690,6 +726,8 @@ class ValidationBenchmark:
                 items.append(
                     {
                         "validation_index": state.validation_index,
+                        "sample_index": state.sample_index,
+                        "run_index": state.run_index,
                         "document_path": str(state.document_path),
                         "document_id": state.center.document_id,
                         "error": self._stage_error("score_answers", exc),
@@ -718,11 +756,29 @@ class ValidationBenchmark:
         rng.shuffle(files)
         return files[: self.validation_size]
 
+    def _expand_run_specs(self, files: list[Path]) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for local_index, document_path in enumerate(files):
+            validation_index = self.start_index + local_index
+            for sample_index in range(self.samples_per_document):
+                specs.append(
+                    {
+                        "validation_index": validation_index,
+                        "sample_index": sample_index,
+                        "run_index": len(specs),
+                        "document_path": document_path,
+                    }
+                )
+        return specs
+
     def _init_document_state(
         self,
-        document_path: Path,
-        validation_index: int,
+        spec: dict[str, Any],
     ) -> DocumentRunState:
+        document_path = spec["document_path"]
+        validation_index = int(spec["validation_index"])
+        sample_index = int(spec["sample_index"])
+        run_index = int(spec["run_index"])
         center = MessageCenter.from_document_json(document_path)
         retriever = ParagraphRetriever(
             document_path,
@@ -730,12 +786,14 @@ class ValidationBenchmark:
         )
         excutor = ParagraphExcutor(document_path)
         paragraph_count = len(excutor.execute())
-        doc_output_dir = self.output_dir / f"{validation_index:03d}_{center.document_id}"
+        doc_output_dir = self.output_dir / f"{validation_index:03d}_s{sample_index:02d}_{center.document_id}"
         doc_output_dir.mkdir(parents=True, exist_ok=True)
         trajectory = TrajectoryStore(
             document_id=center.document_id,
             metadata={
                 "validation_index": validation_index,
+                "sample_index": sample_index,
+                "run_index": run_index,
                 "document_path": str(document_path),
                 "document_topic": center.document_topic,
                 "source_pdf": center.source_pdf,
@@ -746,6 +804,8 @@ class ValidationBenchmark:
         )
         return DocumentRunState(
             validation_index=validation_index,
+            sample_index=sample_index,
+            run_index=run_index,
             document_path=document_path,
             started_at=time.time(),
             center=center,
@@ -772,7 +832,12 @@ class ValidationBenchmark:
             return []
         messages_batch = [request["messages"] for request in requests]
         try:
-            return summary_model.chat_batch(messages_batch, max_new_tokens=max_new_tokens)
+            return summary_model.chat_batch(
+                messages_batch,
+                max_new_tokens=max_new_tokens,
+                temperature=self.summary_temperature,
+                top_p=self.summary_top_p,
+            )
         except Exception as batch_exc:
             print(
                 json.dumps(
@@ -796,6 +861,8 @@ class ValidationBenchmark:
                     summary_model.chat(
                         request["messages"],
                         max_new_tokens=max_new_tokens,
+                        temperature=self.summary_temperature,
+                        top_p=self.summary_top_p,
                     )
                 )
             except Exception as exc:
@@ -967,8 +1034,12 @@ class ValidationBenchmark:
                 try:
                     decision = self._parse_decision(raw_decision)
                 except Exception as exc:
-                    state.error = self._stage_error("submit_decision_parse", exc)
-                    continue
+                    decision = {
+                        "should_submit": False,
+                        "reason": f"submit_decision_parse fallback: {type(exc).__name__}: {exc}",
+                        "additional_keywords": [],
+                        "parse_error": self._stage_error("submit_decision_parse", exc),
+                    }
                 state.trajectory.add_model_call(
                     step_name="submit_decision",
                     round_id=summary_round,
@@ -1047,6 +1118,8 @@ class ValidationBenchmark:
                 "paragraph_count": state.paragraph_count,
             },
             "validation_index": state.validation_index,
+            "sample_index": state.sample_index,
+            "run_index": state.run_index,
             "submitted": state.submitted,
             "submit_round": state.submit_round,
             "early_submit": bool(
@@ -1111,6 +1184,8 @@ class ValidationBenchmark:
                 "paragraph_count": state.paragraph_count,
             },
             "validation_index": state.validation_index,
+            "sample_index": state.sample_index,
+            "run_index": state.run_index,
             "submitted": state.submitted,
             "submit_round": state.submit_round,
             "early_submit": bool(
@@ -1205,6 +1280,8 @@ class ValidationBenchmark:
         components = judge_result["reward_components"]
         return {
             "validation_index": state.validation_index,
+            "sample_index": state.sample_index,
+            "run_index": state.run_index,
             "document_id": center.document_id,
             "answered_questions": components["answered_questions"],
             "total_questions": components["total_questions"],
@@ -1229,6 +1306,8 @@ class ValidationBenchmark:
         summary_model: Any,
         judge_model: DeviceChatModel,
         validation_index: int,
+        sample_index: int = 0,
+        run_index: int | None = None,
     ) -> dict[str, Any]:
         document_started_at = time.time()
         center = MessageCenter.from_document_json(document_path)
@@ -1239,12 +1318,16 @@ class ValidationBenchmark:
         excutor = ParagraphExcutor(document_path)
         paragraph_count = len(excutor.execute())
 
-        doc_output_dir = self.output_dir / f"{validation_index:03d}_{center.document_id}"
+        if run_index is None:
+            run_index = validation_index * self.samples_per_document + sample_index
+        doc_output_dir = self.output_dir / f"{validation_index:03d}_s{sample_index:02d}_{center.document_id}"
         doc_output_dir.mkdir(parents=True, exist_ok=True)
         trajectory = TrajectoryStore(
             document_id=center.document_id,
             metadata={
                 "validation_index": validation_index,
+                "sample_index": sample_index,
+                "run_index": run_index,
                 "document_path": str(document_path),
                 "document_topic": center.document_topic,
                 "source_pdf": center.source_pdf,
@@ -1256,7 +1339,12 @@ class ValidationBenchmark:
         keyword_messages = self.prompt_manager.keyword_extraction_messages(
             center.document_text_message()["document_text"]
         )
-        raw_keywords = summary_model.chat(keyword_messages, max_new_tokens=256)
+        raw_keywords = summary_model.chat(
+            keyword_messages,
+            max_new_tokens=256,
+            temperature=self.summary_temperature,
+            top_p=self.summary_top_p,
+        )
         keywords = self._parse_keyword_list(raw_keywords)
         trajectory.add_model_call(
             step_name="initial_keyword_extraction",
@@ -1314,7 +1402,12 @@ class ValidationBenchmark:
                 )
                 step_name = "revision_summary"
 
-            summary = summary_model.chat(summary_messages, max_new_tokens=768)
+            summary = summary_model.chat(
+                summary_messages,
+                max_new_tokens=768,
+                temperature=self.summary_temperature,
+                top_p=self.summary_top_p,
+            )
             trajectory.add_model_call(
                 step_name=step_name,
                 round_id=summary_round,
@@ -1332,8 +1425,21 @@ class ValidationBenchmark:
                 latest_summary_json=center.latest_summary_json(),
                 recalled_paragraphs_json=center.recalled_paragraphs_json(),
             )
-            raw_decision = summary_model.chat(decision_messages, max_new_tokens=192)
-            decision = self._parse_decision(raw_decision)
+            raw_decision = summary_model.chat(
+                decision_messages,
+                max_new_tokens=192,
+                temperature=self.summary_temperature,
+                top_p=self.summary_top_p,
+            )
+            try:
+                decision = self._parse_decision(raw_decision)
+            except Exception as exc:
+                decision = {
+                    "should_submit": False,
+                    "reason": f"submit_decision_parse fallback: {type(exc).__name__}: {exc}",
+                    "additional_keywords": [],
+                    "parse_error": self._stage_error("submit_decision_parse", exc),
+                }
             trajectory.add_model_call(
                 step_name="submit_decision",
                 round_id=summary_round,
@@ -1404,6 +1510,8 @@ class ValidationBenchmark:
                 "paragraph_count": paragraph_count,
             },
             "validation_index": validation_index,
+            "sample_index": sample_index,
+            "run_index": run_index,
             "submitted": submitted,
             "submit_round": submit_round,
             "early_submit": bool(submitted and submit_round is not None and submit_round < self.max_summary_rounds),
@@ -1494,6 +1602,8 @@ class ValidationBenchmark:
         components = judge_result["reward_components"]
         return {
             "validation_index": validation_index,
+            "sample_index": sample_index,
+            "run_index": run_index,
             "document_id": center.document_id,
             "answered_questions": components["answered_questions"],
             "total_questions": components["total_questions"],
@@ -1511,17 +1621,21 @@ class ValidationBenchmark:
             "judge_result_path": str(judge_path),
         }
 
-    def config(self, processed_count: int) -> dict[str, Any]:
+    def config(self, document_count: int, run_count: int) -> dict[str, Any]:
         return {
             "dataset_root": str(self.dataset_root),
             "split": self.split,
             "split_seed": self.split_seed,
             "validation_size": self.validation_size,
-            "processed_count": processed_count,
+            "document_count": document_count,
+            "run_count": run_count,
+            "samples_per_document": self.samples_per_document,
             "start_index": self.start_index,
             "limit": self.limit,
             "max_summary_rounds": self.max_summary_rounds,
             "summary_batch_size": self.summary_batch_size,
+            "summary_temperature": self.summary_temperature,
+            "summary_top_p": self.summary_top_p,
             "summary_model_path": str(self.summary_model_path),
             "judge_model_path": str(self.judge_model_path),
             "summary_runner": self.summary_runner,
@@ -1697,6 +1811,24 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of documents to batch together for summary-side vLLM calls. Use 1 for sequential mode.",
     )
+    parser.add_argument(
+        "--samples-per-document",
+        type=int,
+        default=1,
+        help="Generate and judge K independent workflow trajectories per document.",
+    )
+    parser.add_argument(
+        "--summary-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for summary-side model calls. Use >0 when samples-per-document > 1.",
+    )
+    parser.add_argument(
+        "--summary-top-p",
+        type=float,
+        default=1.0,
+        help="Top-p for summary-side sampling.",
+    )
     return parser.parse_args()
 
 
@@ -1737,6 +1869,9 @@ def main() -> None:
         limit=args.limit,
         start_index=args.start_index,
         summary_batch_size=args.summary_batch_size,
+        samples_per_document=args.samples_per_document,
+        summary_temperature=args.summary_temperature,
+        summary_top_p=args.summary_top_p,
     )
     benchmark.run()
 

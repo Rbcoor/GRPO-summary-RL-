@@ -14,6 +14,9 @@ GPUS="${GPUS:-1,4}"
 MAX_SUMMARY_ROUNDS="${MAX_SUMMARY_ROUNDS:-5}"
 SUMMARY_BATCH_SIZE=${SUMMARY_BATCH_SIZE:-3}
 JUDGE_BATCH_SIZE=${JUDGE_BATCH_SIZE:-6}
+SAMPLES_PER_DOCUMENT=${SAMPLES_PER_DOCUMENT:-1}
+SUMMARY_TEMPERATURE=${SUMMARY_TEMPERATURE:-0.0}
+SUMMARY_TOP_P=${SUMMARY_TOP_P:-1.0}
 LIMIT_ARGS=()
 
 if [[ "${LIMIT:-}" != "" ]]; then
@@ -36,6 +39,9 @@ fi
   --judge-max-new-tokens "${JUDGE_MAX_NEW_TOKENS:-1024}" \
   --judge-batch-size "${JUDGE_BATCH_SIZE}" \
   --summary-batch-size "${SUMMARY_BATCH_SIZE}" \
+  --samples-per-document "${SAMPLES_PER_DOCUMENT}" \
+  --summary-temperature "${SUMMARY_TEMPERATURE}" \
+  --summary-top-p "${SUMMARY_TOP_P}" \
   --max-summary-rounds "${MAX_SUMMARY_ROUNDS}" \
   --output-dir "${OUTPUT_DIR}" \
   "${LIMIT_ARGS[@]}"

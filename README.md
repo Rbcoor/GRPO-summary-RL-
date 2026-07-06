@@ -68,6 +68,33 @@ The following steps execute when a training run on a new cluster begins:
 - **Upload the final model checkpoint to S3.**
   - This usually takes a few seconds.
 
+### Generating Offline GRPO Trajectories
+
+The original online trainer builds one `TrajectoryGroup` per document and samples
+several independent rollouts for that same document. GRPO needs that group-level
+reward variation to compute relative advantages.
+
+For local/offline data generation, `run_validation_vllm.sh` can generate `K`
+independent workflow trajectories per document:
+
+```bash
+OUTPUT_DIR=/tmp/summary_train_k4 \
+LIMIT=3500 \
+SAMPLES_PER_DOCUMENT=4 \
+SUMMARY_TEMPERATURE=0.7 \
+SUMMARY_TOP_P=0.9 \
+SUMMARY_BATCH_SIZE=3 \
+JUDGE_BATCH_SIZE=6 \
+GPUS=1,4 \
+./run_validation_vllm.sh
+```
+
+Each sample is saved under a separate directory, for example
+`000_s00_<document_id>/` and `000_s01_<document_id>/`, and report items include
+`validation_index`, `sample_index`, and `run_index`. Use a nonzero
+`SUMMARY_TEMPERATURE` when `SAMPLES_PER_DOCUMENT > 1`; otherwise repeated samples
+will usually be deterministic duplicates.
+
 ### 5. Shutting down the cluster
 
 When you're done training and running benchmarks, you can shut down the cluster in two ways:
